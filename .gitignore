@@ -1,0 +1,7 @@
+# Сборка
+build/
+build-*/
+*.user
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
