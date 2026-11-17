@@ -5,3 +5,7 @@ build-*/
 CMakeUserPresets.json
 CMakeCache.txt
 CMakeFiles/
+
+# Логи тестового отправителя
+sender.log
+sender.err.log

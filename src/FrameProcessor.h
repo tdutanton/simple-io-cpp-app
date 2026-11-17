@@ -30,6 +30,9 @@ public:
 
 public slots:
     void setMode(int mode);
+    // Искусственная задержка обработки (мс) — только для демонстрации того,
+    // что происходит при перегрузке. В реальном коде такого быть не должно.
+    void setDelayMs(int ms);
     void processFrame(const proto::VideoFrame& frame);
 
 signals:
@@ -43,7 +46,6 @@ signals:
     void log(const QString& msg);
 
 private:
-    static QImage sobel(const QImage& src);
-
     int m_mode = Passthrough;
+    int m_delayMs = 0;
 };

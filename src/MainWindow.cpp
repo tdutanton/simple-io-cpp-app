@@ -10,13 +10,18 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
+#include "BatchFrameProcessor.h"
 #include "FrameProcessor.h"
+#include "FrameQueueProducer.h"
+#include "SpscChannel.h"
 #include "UdpReceiver.h"
 #include "VideoWidget.h"
 
-MainWindow::MainWindow(quint16 port, QWidget* parent)
+MainWindow::MainWindow(quint16 port, Transport transport, int processDelayMs, QWidget* parent)
     : QMainWindow(parent)
     , m_port(port)
+    , m_transport(transport)
+    , m_processDelayMs(processDelayMs)
 {
     buildUi();
     updateStatus();
@@ -29,9 +34,17 @@ MainWindow::MainWindow(quint16 port, QWidget* parent)
     connect(watchdog, &QTimer::timeout, this, &MainWindow::onWatchdog);
     watchdog->start();
 
+    if (m_channel) {
+        m_transportStatsTimer->start();
+    } else {
+        m_transportLabel->setText(tr("транспорт: сигналы (QueuedConnection)"));
+    }
+
     m_fpsClock.start();
     resize(1100, 640);
-    setWindowTitle(tr("Телеметрия и видео по UDP — пример на Qt6"));
+    setWindowTitle(m_transport == Transport::Spsc
+                       ? tr("Телеметрия и видео по UDP — SPSC-очередь + батчинг")
+                       : tr("Телеметрия и видео по UDP — сигналы Qt"));
 }
 
 MainWindow::~MainWindow()
@@ -100,6 +113,11 @@ void MainWindow::buildUi()
     m_logLabel->setStyleSheet(QStringLiteral("color: #7f8c8d;"));
     statusBar()->addPermanentWidget(m_logLabel);
 
+    // Счётчики транспорта: для SPSC показывают глубину кольца и размеры пачек.
+    m_transportLabel = new QLabel(this);
+    m_transportLabel->setStyleSheet(QStringLiteral("color: #7f8c8d;"));
+    statusBar()->addPermanentWidget(m_transportLabel);
+
     m_fpsLabel = new QLabel(QStringLiteral("—"), this);
     m_fpsLabel->setMinimumWidth(80);
     m_fpsLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -110,6 +128,10 @@ void MainWindow::buildUi()
     m_logClearTimer->setInterval(4000);
     connect(m_logClearTimer, &QTimer::timeout, this, [this]() { m_logLabel->clear(); });
 
+    m_transportStatsTimer = new QTimer(this);
+    m_transportStatsTimer->setInterval(500);
+    connect(m_transportStatsTimer, &QTimer::timeout, this, &MainWindow::onTransportStats);
+
     // QCheckBox::toggled(bool) есть во всех версиях Qt6 (checkStateChanged
     // появился только в 6.7), поэтому берём его.
     connect(m_edgesCheck, &QCheckBox::toggled, this, &MainWindow::onModeEnabled);
@@ -118,10 +140,15 @@ void MainWindow::buildUi()
 void MainWindow::startThreads()
 {
     // -----------------------------------------------------------------------
-    // Поток 1: сеть.
+    // Поток 1: сеть. Общий для обоих вариантов.
     // -----------------------------------------------------------------------
     m_rxThread = new QThread;
     m_rx = new UdpReceiver(m_port);
+
+    // В SPSC-варианте ждать подтверждения от обработчика не нужно: перепол-
+    // нение ловит кольцевой буфер. Флаг ставим до старта потока.
+    m_rx->setRequireAck(m_transport == Transport::Signals);
+
     m_rx->moveToThread(m_rxThread);
 
     // ВАЖНО: сокет создаётся внутри UdpReceiver::start(), то есть уже в
@@ -129,26 +156,55 @@ void MainWindow::startThreads()
     // выполняется в GUI-потоке, — значит потом работать с ним из чужого потока.
     connect(m_rxThread, &QThread::started, m_rx, &UdpReceiver::start);
 
-    // -----------------------------------------------------------------------
-    // Поток 2: обработка.
-    // -----------------------------------------------------------------------
-    m_procThread = new QThread;
-    m_proc = new FrameProcessor;
-    m_proc->moveToThread(m_procThread);
-
-    // -----------------------------------------------------------------------
-    // Соединения. Тип Auto сам становится Queued, потому что объекты живут
-    // в разных потоках: сигнал кладёт событие в очередь получателя, и слот
-    // выполняется уже в его потоке.
-    // -----------------------------------------------------------------------
-    connect(m_rx, &UdpReceiver::frameReceived, m_proc, &FrameProcessor::processFrame);
-    connect(m_proc, &FrameProcessor::frameProcessed, m_rx, &UdpReceiver::onFrameProcessed);
-
-    connect(m_proc, &FrameProcessor::frameReady, this, &MainWindow::onFrameReady);
     connect(m_rx, &UdpReceiver::telemetryReceived, this, &MainWindow::onTelemetry);
     connect(m_rx, &UdpReceiver::statsUpdated, this, &MainWindow::onStats);
     connect(m_rx, &UdpReceiver::log, this, &MainWindow::onLog);
-    connect(m_proc, &FrameProcessor::log, this, &MainWindow::onLog);
+
+    // -----------------------------------------------------------------------
+    // Поток 2: обработка. Здесь варианты расходятся.
+    // -----------------------------------------------------------------------
+    m_procThread = new QThread;
+
+    if (m_transport == Transport::Signals) {
+        // --- Вариант 1: сигнал + QueuedConnection -------------------------
+        m_proc = new FrameProcessor;
+        m_proc->setDelayMs(m_processDelayMs);
+        m_proc->moveToThread(m_procThread);
+
+        // Тип Auto сам становится Queued: объекты в разных потоках. Сигнал
+        // кладёт событие в очередь получателя с копией аргументов.
+        connect(m_rx, &UdpReceiver::frameReceived, m_proc, &FrameProcessor::processFrame);
+
+        // Обратная связь: «кадр принят в работу» — снимает backpressure.
+        connect(m_proc, &FrameProcessor::frameProcessed, m_rx, &UdpReceiver::onFrameProcessed);
+
+        connect(m_proc, &FrameProcessor::frameReady, this, &MainWindow::onFrameReady);
+        connect(m_proc, &FrameProcessor::log, this, &MainWindow::onLog);
+    } else {
+        // --- Вариант 2: SPSC-кольцо + батчинг -----------------------------
+        m_channel = new SpscChannel;
+
+        // Producer живёт в потоке сети; соединение прямое, потому что оба
+        // объекта в одном потоке. Это обычный вызов функции, без очередей.
+        m_producer = new FrameQueueProducer(m_channel);
+        m_producer->moveToThread(m_rxThread);
+        connect(m_rx, &UdpReceiver::frameReceived, m_producer,
+                &FrameQueueProducer::onFrame, Qt::DirectConnection);
+
+        // Потребитель занимает свой поток целиком: свой цикл + блокировка на
+        // семафоре. Прямое соединение от started выполнится до входа в exec(),
+        // которого в этом потоке так и не случится.
+        m_batch = new BatchFrameProcessor(m_channel);
+        m_batch->setDelayMs(m_processDelayMs);
+        m_batch->moveToThread(m_procThread);
+        connect(m_procThread, &QThread::started, m_batch, &BatchFrameProcessor::run,
+                Qt::DirectConnection);
+
+        // Наружу (в GUI) — по-прежнему сигнал: это контрольная плоскость,
+        // 25-60 событий в секунду, здесь экономить нечего.
+        connect(m_batch, &BatchFrameProcessor::frameReady, this, &MainWindow::onFrameReady);
+        connect(m_batch, &BatchFrameProcessor::log, this, &MainWindow::onLog);
+    }
 
     m_rxThread->start();
     m_procThread->start();
@@ -169,6 +225,12 @@ void MainWindow::stopThreads()
         m_rxThread->quit();
         m_rxThread->wait(2000);
     }
+
+    // Цикл потребителя не крутится на событийном цикле, поэтому quit() его не
+    // остановит: поднимаем флаг и будим семафор.
+    if (m_batch)
+        m_batch->requestStop();
+
     if (m_procThread) {
         m_procThread->quit();
         m_procThread->wait(2000);
@@ -178,6 +240,12 @@ void MainWindow::stopThreads()
     m_rx = nullptr;
     delete m_proc;
     m_proc = nullptr;
+    delete m_batch;
+    m_batch = nullptr;
+    delete m_producer;
+    m_producer = nullptr;
+    delete m_channel;
+    m_channel = nullptr;
 
     delete m_rxThread;
     m_rxThread = nullptr;
@@ -193,13 +261,36 @@ void MainWindow::setEdgesEnabled(bool on)
 
 void MainWindow::onModeEnabled(bool enabled)
 {
+    const int mode = enabled ? 1 : 0;  // 1 — Sobel, 0 — только декод
+
+    if (m_batch) {
+        // SPSC: управление не через очередь (она занята данными) — атомик,
+        // который потребитель читает в своём цикле.
+        m_batch->setMode(mode);
+        return;
+    }
+
     if (!m_proc)
         return;
-    // Вызов слота «чужого» объекта обязан идти через очередь: invokeMethod
-    // с Qt::QueuedConnection выполнит его в потоке обработчика.
-    QMetaObject::invokeMethod(m_proc, "setMode", Qt::QueuedConnection,
-                              Q_ARG(int, enabled ? FrameProcessor::Edges
-                                                 : FrameProcessor::Passthrough));
+    // Сигнальный вариант: слот «чужого» объекта вызываем через очередь,
+    // иначе он выполнится в потоке GUI.
+    QMetaObject::invokeMethod(m_proc, "setMode", Qt::QueuedConnection, Q_ARG(int, mode));
+}
+
+void MainWindow::onTransportStats()
+{
+    if (!m_channel)
+        return;
+
+    const SpscStats& s = m_channel->stats;
+    m_transportLabel->setText(
+        tr("SPSC: в очереди %1/%2 · отправлено %3 · сброшено %4 · пачек %5 · макс. %6")
+            .arg(int(m_channel->queue.size()))
+            .arg(int(SpscChannel::kCapacity - 1))
+            .arg(s.pushed.load(std::memory_order_relaxed))
+            .arg(s.droppedFull.load(std::memory_order_relaxed))
+            .arg(s.batches.load(std::memory_order_relaxed))
+            .arg(s.maxBatch.load(std::memory_order_relaxed)));
 }
 
 void MainWindow::onTelemetry(const proto::Telemetry& t)

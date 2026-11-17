@@ -12,27 +12,47 @@ class QThread;
 class QTimer;
 class UdpReceiver;
 class FrameProcessor;
+class BatchFrameProcessor;
+class FrameQueueProducer;
 class VideoWidget;
+struct SpscChannel;
+
+// Как кадр едет из потока сети в поток обработки.
+enum class Transport {
+    Signals,  // сигнал + QueuedConnection (вариант 1, «канонический» Qt)
+    Spsc,     // кольцевой буфер SPSC + семафор + батчинг (вариант 2)
+};
 
 // ---------------------------------------------------------------------------
 // MainWindow — поток GUI. Здесь только виджеты и «склейка»: он создаёт
 // рабочие потоки, соединяет сигналы и обновляет интерфейс.
 //
-// Схема потоков:
+// Вариант 1 (Transport::Signals):
 //
-//   [поток сети]  UdpReceiver   сокет, парсинг, сборка кадров
-//        |  сигнал frameReceived (QueuedConnection)
+//   [поток сети]  UdpReceiver
+//        |  frameReceived (QueuedConnection: событие + копия аргументов)
 //        v
-//   [поток обработки] FrameProcessor   JPEG-декод + фильтр
-//        |  сигнал frameReady (QueuedConnection)
+//   [поток обработки] FrameProcessor (слот на цикле событий Qt)
+//        |  frameReady (QueuedConnection)
 //        v
-//   [поток GUI]  MainWindow / VideoWidget   показ
+//   [поток GUI]  MainWindow / VideoWidget
+//
+// Вариант 2 (Transport::Spsc):
+//
+//   [поток сети]  UdpReceiver --(прямое соединение, обычный вызов)-->
+//                 FrameQueueProducer --> SpscQueue (без блокировок)
+//                                              |  семафор "есть работа"
+//   [поток обработки] BatchFrameProcessor <----+  свой цикл, пачками
+//        |  frameReady (QueuedConnection — только наружу, в GUI)
+//        v
+//   [поток GUI]  MainWindow / VideoWidget
 // ---------------------------------------------------------------------------
 class MainWindow : public QMainWindow {
     Q_OBJECT
 
 public:
-    explicit MainWindow(quint16 port, QWidget* parent = nullptr);
+    explicit MainWindow(quint16 port, Transport transport, int processDelayMs = 0,
+                        QWidget* parent = nullptr);
     ~MainWindow() override;
 
     // Включить фильтр сразу при старте (используется флагом --edges).
@@ -46,6 +66,7 @@ private slots:
     void onLog(const QString& msg);
     void onWatchdog();
     void onModeEnabled(bool enabled);
+    void onTransportStats();
 
 private:
     void buildUi();
@@ -54,11 +75,20 @@ private:
     void updateStatus();
 
     quint16 m_port;
+    Transport m_transport;
+    int m_processDelayMs;
 
     QThread* m_rxThread = nullptr;
     UdpReceiver* m_rx = nullptr;
     QThread* m_procThread = nullptr;
+
+    // Вариант 1
     FrameProcessor* m_proc = nullptr;
+
+    // Вариант 2
+    SpscChannel* m_channel = nullptr;
+    FrameQueueProducer* m_producer = nullptr;
+    BatchFrameProcessor* m_batch = nullptr;
 
     VideoWidget* m_video = nullptr;
     QCheckBox* m_edgesCheck = nullptr;
@@ -77,7 +107,9 @@ private:
     QLabel* m_statusLabel = nullptr;
     QLabel* m_logLabel = nullptr;
     QLabel* m_fpsLabel = nullptr;
+    QLabel* m_transportLabel = nullptr;
     QTimer* m_logClearTimer = nullptr;
+    QTimer* m_transportStatsTimer = nullptr;
 
     QElapsedTimer m_lastTelemetryClock;
     QElapsedTimer m_lastFrameClock;

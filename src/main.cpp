@@ -37,11 +37,21 @@ int main(int argc, char* argv[])
                                    QStringLiteral("seconds"), QStringLiteral("3"));
     QCommandLineOption edgesOption(QStringLiteral("edges"),
                                    QStringLiteral("Включить фильтр Собеля при старте."));
+    QCommandLineOption transportOption(
+        QStringLiteral("transport"),
+        QStringLiteral("Транспорт кадра: signals (сигналы Qt) или spsc (кольцо + батчинг)."),
+        QStringLiteral("mode"), QStringLiteral("signals"));
+    QCommandLineOption slowOption(
+        QStringLiteral("slow"),
+        QStringLiteral("Искусственная задержка обработки кадра, мс (демонстрация перегрузки)."),
+        QStringLiteral("ms"), QStringLiteral("0"));
 
     parser.addOption(portOption);
     parser.addOption(shotOption);
     parser.addOption(afterOption);
     parser.addOption(edgesOption);
+    parser.addOption(transportOption);
+    parser.addOption(slowOption);
     parser.process(app);
 
     bool ok = false;
@@ -51,7 +61,17 @@ int main(int argc, char* argv[])
         return 2;
     }
 
-    MainWindow window(port);
+    const QString transportName = parser.value(transportOption).toLower();
+    Transport transport = Transport::Signals;
+    if (transportName == QStringLiteral("spsc")) {
+        transport = Transport::Spsc;
+    } else if (transportName != QStringLiteral("signals")) {
+        qCritical("Неизвестный транспорт: %s (ожидается signals или spsc)",
+                  qPrintable(transportName));
+        return 2;
+    }
+
+    MainWindow window(port, transport, parser.value(slowOption).toInt());
     window.show();
 
     if (parser.isSet(edgesOption))

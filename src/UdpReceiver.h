@@ -24,6 +24,14 @@ public:
     explicit UdpReceiver(quint16 port, QObject* parent = nullptr);
     ~UdpReceiver() override;
 
+    // Два способа ограничить поток кадров:
+    //   true  (по умолчанию, сигнальный вариант) — ждём подтверждения от
+    //         обработчика, пока его нет новые кадры отбрасываются;
+    //   false (SPSC-вариант) — не ждём ничего: backpressure обеспечивает
+    //         кольцевой буфер, который просто не примет кадр, когда полон.
+    // Вызывать до старта потока приёмника.
+    void setRequireAck(bool on);
+
 public slots:
     // Вызывается уже в потоке приёмника (Qt::QueuedConnection от QThread::started).
     void start();
@@ -68,6 +76,7 @@ private:
 
     // Backpressure: ждём подтверждения от обработчика не дольше kWaitAckMs.
     bool m_waitingForProcessor = false;
+    bool m_requireAck = true;
     QElapsedTimer m_waitClock;
 
     // Счётчики

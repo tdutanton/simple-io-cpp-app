@@ -220,12 +220,17 @@ void UdpReceiver::deliverFrame(quint32 frameId)
     ds.setByteOrder(QDataStream::LittleEndian);
     ds >> ts;
 
-    if (m_waitingForProcessor) {
-        // Обработчик занят — не плодим очередь, просто теряем этот кадр.
-        // Для видео это правильная стратегия: свежий кадр важнее всех прошлых.
-        ++m_framesDroppedBusy;
-        return;
+    if (m_requireAck) {
+        if (m_waitingForProcessor) {
+            // Обработчик занят — не плодим очередь, просто теряем этот кадр.
+            // Для видео это правильная стратегия: свежий кадр важнее прошлых.
+            ++m_framesDroppedBusy;
+            return;
+        }
+        m_waitingForProcessor = true;
+        m_waitClock.start();
     }
+    // В SPSC-варианте ждать некого: переполнение обработает кольцевой буфер.
 
     proto::VideoFrame frame;
     frame.id = frameId;
@@ -233,11 +238,14 @@ void UdpReceiver::deliverFrame(quint32 frameId)
     frame.encoded = joined.mid(8);
     frame.fragments = fragments;
 
-    m_waitingForProcessor = true;
-    m_waitClock.start();
     ++m_framesOk;
 
     emit frameReceived(frame);
+}
+
+void UdpReceiver::setRequireAck(bool on)
+{
+    m_requireAck = on;
 }
 
 void UdpReceiver::onFrameProcessed(quint32 /*frameId*/)
